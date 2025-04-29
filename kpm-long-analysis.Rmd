@@ -1,0 +1,332 @@
+---
+title: "KPM Long (KPM-2) Analysis"
+author: "Ethan Allavarpu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    df_print: kable
+editor_options: 
+  chunk_output_type: console
+hoqc_output: "../output/pdf_results/kpm-long-analysis.pdf"
+knit: (function (...) { HOQCutil::myknit(...) })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, comment = NA)
+options(knitr.kable.NA = "")
+
+# Set-up
+rm(list = ls()) #This line of code in R removes all objects from the current workspace. The function ls() lists all objects in the workspace and rm(list = ls()) deletes all of them. This can be a way to clean up the workspace before starting a new analysis or to free up memory.
+
+library(here)
+library(lubridate)
+library(readxl)
+library(tabulator)
+library(tidyverse)
+```
+
+```{r load-data}
+# joined_kpm_long
+load(here("output/kpm_and_fluegas/kpm_long_survey.RData"))
+joined_kpm_long <- joined_kpm_long %>%
+    filter(str_detect(str_to_lower(kiln_id), "pilot", negate = TRUE))
+```
+
+```{r create-analysis-vars}
+# % Distribution of Quality of Bricks
+cat("Percent Distribution of the Quality of Bricks\n")
+kpm_long <- joined_kpm_long %>%
+    mutate(broken_brick_count = broken_bricks_cubic_feet * 8.14,
+           other_brick_type_count = replace_na(other_type_1_count, 0) +
+               replace_na(other_type_2_count, 0),
+           total_number_bricks = class_1_count + class_1_5_count +
+               class_2_count + class_3_count + broken_brick_count,
+           pct_class_1_brick = class_1_count / total_number_bricks,
+           pct_class_1_5_brick = class_1_5_count / total_number_bricks,
+           pct_class_2_brick = class_2_count / total_number_bricks,
+           pct_class_3_brick = class_3_count / total_number_bricks,
+           pct_broken_brick = broken_brick_count / total_number_bricks)
+
+kpm_long %>%
+    select(kiln_id, pct_class_1_brick:pct_broken_brick) %>%
+    rename_with(str_remove, pattern = "_brick") %>%
+    mutate_if(is.numeric, round, digits = 5) %>%
+    head(n = 20)
+
+# look at outcome by treatment
+kpm_long %>%
+    group_by(treatment) %>%
+    summarise(
+        pct_class_1_brick = mean(pct_class_1_brick, na.rm = T)
+    )
+
+# look at outcome by adoption status
+kpm_long %>%
+    group_by(adopter) %>%
+    summarise(
+        pct_class_1_brick = mean(pct_class_1_brick, na.rm = T)
+    )
+
+# Specific Energy Consumption
+cat("Specific Energy Consumption\n")
+kpm_long <- kpm_long %>%
+    rename(any_other_weight_remaining_kg = any_other_weight_remaining,
+           single_brick_weight = fired_brick_weight) %>%
+    mutate(
+        total_bricks_fired = bricks_1_chamber_count * chamber_completed_during_monitoring_count,
+        weight_bricks_fired = single_brick_weight * total_bricks_fired,
+        total_energy_input = 0
+    )
+
+fuels <- c("indonesian_coal", "south_african_coal", "usa_coal", "indian_coal",
+           "australian_coal", "russian_coal", "sawdust", "rice_husk",
+           "firewood", "animal_dung", "other_biomass", "any_other")
+fuel_lookup <- c(
+    "indonesian_coal" = "Indonesian Coal",
+    "south_african_coal" = "South African Coal",
+    "indian_coal" = "Indian Coal",
+    "sawdust" = "Saw Dust",
+    "rice_husk" = "Rice Husk",
+    "sawdust" = "Wood Powder"
+)
+
+# Get specific caloric vals from the Coal Heating Values Excel file
+fuel_calorific_vals <- read_excel(here("input/Coal Heating Values.xlsx")) %>%
+    filter(!is.na(`Sample Name`)) %>%
+    mutate_at("GHV (kca/kg)", as.numeric) %>%
+    group_by(fuel_name = `Sample Name`) %>%
+    summarise(calorific_val = mean(`GHV (kca/kg)`))
+
+for (fuel in fuels) {
+    column_names <- paste0(fuel, c("_consumed", "_weight_initial_kg",
+                                   "_weight_remaining_kg"))
+    kpm_long[[column_names[1]]] <- replace_na(kpm_long[[column_names[2]]], 0) -
+        replace_na(kpm_long[[column_names[3]]], 0)
+    calorific_value <- ifelse(
+        fuel %in% names(fuel_lookup),
+        yes = fuel_calorific_vals %>%
+            filter(fuel_name %in% fuel_lookup[names(fuel_lookup) == fuel]) %>%
+            pull(calorific_val),
+        no = ifelse(
+            fuel %in% c("indonesian_coal", "south_african_coal", "usa_coal",
+                        "indian_coal", "australian_coal", "russian_coal",
+                        "any_other"),
+            yes = 6000, no = 3500
+        )
+    )
+    kpm_long <- kpm_long %>%
+        mutate(
+            total_energy_input = total_energy_input + (
+                calorific_value * kpm_long[[column_names[1]]]
+                )
+        )
+}
+
+cef <- 25.8
+cc <- 3.67
+
+kpm_long <- kpm_long %>%
+    mutate(total_fuel_consumed = indonesian_coal_consumed +
+               south_african_coal_consumed + usa_coal_consumed +
+               indian_coal_consumed + australian_coal_consumed +
+               russian_coal_consumed + sawdust_consumed + rice_husk_consumed +
+               firewood_consumed + other_biomass_consumed + any_other_consumed,
+           specific_fuel_consumption = (
+               (total_fuel_consumed / 1000) / total_bricks_fired * 100000
+           ),
+           total_energy_input = (total_energy_input * 4.18) / 1000,
+           sec = total_energy_input / weight_bricks_fired,
+           # CO2 = SEC * CEF * CC * Weight of 1 Lakh / 10^6
+           co2_emission = (sec * cef * cc * single_brick_weight * 100000) / 10^6)
+
+# kpm_long %>%
+#     select(kiln_id, specific_fuel_consumption, sec, co2_emission) %>%
+#     mutate_if(is.numeric, round, digits = 5) %>%
+#     head(n = 20)
+
+# look at outcomes by treatment
+kpm_long %>%
+    group_by(treatment) %>%
+    summarise(
+        sfc = mean(specific_fuel_consumption, na.rm = T),
+        sec = mean(sec, na.rm = T),
+        co2_emission = mean(co2_emission, na.rm = T)
+    )
+
+# look at outcomes by adoption status
+kpm_long %>%
+    group_by(adopter) %>%
+    summarise(
+       sfc = mean(specific_fuel_consumption, na.rm = T),
+        sec = mean(sec, na.rm = T),
+        co2_emission = mean(co2_emission, na.rm = T)
+    )
+
+```
+
+```{r combine-flue-gas-analysis}
+# fluegas_analysis
+load(here("output/clean/flue_gas_analysis_1_minute.Rdata"))
+cycle_time_columns <- colnames(kpm_long) %>%
+    subset(subset = str_detect(., pattern = "^cycle_[1-6].*_time_min"))
+
+# Calculate the total fuel feeding duration for each kiln
+# Also get the percent of time fuel feeding pre (include the 4 trimmed minutes)
+# and post (excluding the 4 trimmed minutes)
+flue_kpm_long <- kpm_long %>%
+    mutate_at(cycle_time_columns, replace_na, 0) %>%
+    mutate(fuel_feeding_duration_s = 60 * (
+        cycle_1_time_min + cycle_2_time_min + cycle_3_time_min +
+            cycle_4_time_min + cycle_5_time_min + cycle_6_time_min
+        )) %>%
+    inner_join(fluegas_analysis %>%
+                   select(-c(treatment:any_inelig_notoper_demolished)),
+               by = "kiln_id") %>%
+    mutate(pre_pct_time_feeding = fuel_feeding_duration_s / (total_duration_s + 4 * 60),
+           post_pct_time_feeding = fuel_feeding_duration_s / total_duration_s,
+           brick_weight_1_lakh = single_brick_weight * 100000,
+           energy_input_1_lakh = brick_weight_1_lakh * sec,
+           pm_2_5_emissions = 0.25 * energy_input_1_lakh / 1000)
+
+# cat("Flue Gas Analysis\n")
+# flue_kpm_long %>%
+#     select(kiln_id, average_co_co2_ratio, pct_time_feeding) %>%
+#     mutate_if(is.numeric, round, digits = 5) %>%
+#     head(n = 20)
+
+cat("Investigate kilns with pct_time_feeding above 100%\n")
+flue_kpm_long %>%
+    filter(post_pct_time_feeding > 1) %>%
+    select(kiln_id, flue_gas_analysis_time = total_duration_s,
+           fuel_feeding_time = fuel_feeding_duration_s,
+           pre_pct_time_feeding, post_pct_time_feeding) %>%
+    mutate_at(c("flue_gas_analysis_time", "fuel_feeding_time"), seconds_to_period) %>%
+    mutate_at(c("flue_gas_analysis_time", "fuel_feeding_time"),
+              str_replace_all, pattern = "(?<= )([0-9][HMS])", replacement = "0\\1") %>%
+    mutate_if(is.numeric, round, digits = 5) %>%
+    arrange(desc(post_pct_time_feeding))
+
+# If fuel feeding time about 1, replace with 1
+flue_kpm_long <- flue_kpm_long %>%
+    mutate(pre_pct_time_feeding = case_when(
+        pre_pct_time_feeding > 1 ~ 1,
+        TRUE ~ pre_pct_time_feeding
+    ))
+
+cat("Investigate kilns with pre_pct_time_feeding below 33%\n")
+flue_kpm_long %>%
+    filter(pre_pct_time_feeding < 0.33) %>%
+    select(kiln_id, flue_gas_analysis_time = total_duration_s,
+           fuel_feeding_time = fuel_feeding_duration_s,
+           pre_pct_time_feeding, post_pct_time_feeding) %>%
+    mutate_at(c("flue_gas_analysis_time", "fuel_feeding_time"), seconds_to_period) %>%
+    mutate_at(c("flue_gas_analysis_time", "fuel_feeding_time"),
+              str_replace_all, pattern = "(?<= )([0-9][HMS])", replacement = "0\\1") %>%
+    mutate_if(is.numeric, round, digits = 5) %>%
+    arrange(pre_pct_time_feeding)
+
+
+
+# look at outcomes by treatment --- why is the mean for incentive undefined, we're not missing that data
+flue_kpm_long %>%
+    group_by(treatment) %>%
+    filter(!is.infinite(average_co_co2_ratio_calculated)) %>%
+    summarise(
+        co_co2 = mean(average_co_co2_ratio_calculated, na.rm = T),
+        co_co2_max = max(average_co_co2_ratio_calculated, na.rm = T)  
+        )
+
+# look at outcomes by adoption status - why is the mean for adopter == T undefined, we're not missing that data
+flue_kpm_long %>%
+    group_by(adopter) %>%
+    filter(!is.infinite(average_co_co2_ratio_calculated)) %>%
+    summarise(
+        co_co2 = mean(average_co_co2_ratio_calculated, na.rm = T),
+        co_co2_max = max(average_co_co2_ratio_calculated, na.rm = T)  
+    )
+```
+
+```{r}
+flue_kpm_long <- flue_kpm_long %>%
+    mutate(monitor_time_hr = monitor_time / 60,
+           n_bricks = bricks_1_chamber_count * chamber_completed_during_monitoring_count,
+           n_bricks_24_hr = n_bricks / monitor_time_hr * 24) %>%
+    # Binary flag for each practice
+    # 1 if adopted, 0 otherwise
+    mutate(
+        change_pattern = as.numeric(brick_setting_type == "double_triple_zigzag"),
+        single_fireman = as.numeric(feeding_fuel_method == "continuous_w_single_fireman"),
+        ash_layer_9_in = as.numeric(ash_layer_thickness_inches >= 9),
+        cavity_wall = as.numeric(
+            closing_wicket_gate_method %in% c(
+                "double_brick_wall_w_ash_cavity", "metal_sheet_w_double_brick_w_ash_cavity"
+            )
+        ),
+        sawdust_biomass_front = as.numeric(sawdust_biomass_used == "yes"),
+    ) %>%
+    # Replace NA with 0 (because they didn't adopt this practice)
+    mutate_at(c("change_pattern", "single_fireman", "ash_layer_9_in",
+                "cavity_wall", "sawdust_biomass_front"), replace_na, replace = 0) %>%
+    mutate(n_practices_adopted = (
+        change_pattern + single_fireman + ash_layer_9_in + cavity_wall + sawdust_biomass_front
+        ))
+
+# Data stored as `baseline` in .RData file
+load(here("output/clean/baseline.RData"))
+flue_kpm_long <- flue_kpm_long %>%
+    left_join(baseline %>%
+                  select(kiln_id, blocks, original_sample, expansion_sample) %>%
+                  filter(!duplicated(kiln_id)),
+              by = "kiln_id")
+```
+
+# Add additional analysis variables
+
+```{r}
+# Total production and consumption, specific consumption
+# Total production in lakhs
+# Total consumption in tons
+# Specific consumption in tons/lakh
+flue_kpm_long <- flue_kpm_long %>%
+    mutate(
+        total_production_kpm = total_number_bricks / 100000,
+        total_fuel_consumed_kpm = (
+            indonesian_coal_consumed + south_african_coal_consumed +
+            usa_coal_consumed + indian_coal_consumed +
+            australian_coal_consumed + russian_coal_consumed +
+            sawdust_consumed + rice_husk_consumed + firewood_consumed
+        ) * 0.001,
+        total_coal_consumed_kpm = (
+            indonesian_coal_consumed + south_african_coal_consumed +
+            usa_coal_consumed + indian_coal_consumed +
+            australian_coal_consumed + russian_coal_consumed
+        ) * 0.001,
+        specific_fuel_consumption_kpm = total_fuel_consumed_kpm / (total_bricks_fired / 100000),
+        specific_coal_consumption_kpm = total_coal_consumed_kpm / (total_bricks_fired / 100000)
+    )
+
+```
+
+# Classify early adopters
+
+```{r early adopters}
+flue_kpm_long <-  flue_kpm_long %>%
+    mutate_at(vars(ends_with("_circuit")), ~as.numeric(.x)) %>%
+    mutate(
+        early_adopter_0 = case_when(
+            adopter & continuous_feeding_single_fireman_circuit == 0 & double_triple_zigzag_circuit == 0 ~ 1,
+            T ~ 0
+        ),
+        early_adopter_0_1 = case_when(
+            adopter & continuous_feeding_single_fireman_circuit %in% c(0,1) & double_triple_zigzag_circuit %in% c(0, 1) ~ 1,
+            T ~ 0
+        )
+    )
+
+```
+
+```{r}
+save(flue_kpm_long, file = here("output/clean/kpm_long.RData"))
+```
+
+All results (the combined dataset) can be found at `output/clean/kpm_long.RData`.
